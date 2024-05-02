@@ -1,0 +1,559 @@
+---
+title: "KS_STM"
+format: html
+editor: visual
+---
+
+## STM
+
+```{r}
+library(tidyverse)
+library(stm)
+library(stminsights)
+library(parallel)
+library(vroom)
+library(broom)
+library(reticulate)
+library(reshape2)
+library(tidyr)
+library(cowplot)
+library(writexl)
+library(ggplot2)
+library(RColorBrewer)
+py_config()
+```
+
+```{r}
+df <- data.frame(py_load_object('./240407_KS_KCI_merged_tokens.pkl'))
+```
+
+```{r}
+names(df)
+```
+
+```{r}
+# 필요한 컬럼만 활용
+df <- df %>% select(id,publication_year, origin, tokens,cited_by_count)
+```
+
+```{r}
+df$origin <- as.factor(df$origin)
+```
+
+```{r}
+# 토큰 리스트->문자열 처리 (for STM)
+df$tokens <- map_chr(df$tokens,str_c,collapse='  ')
+```
+
+```{r}
+stopwords <- c('pp','study','kim','chapter')
+```
+
+```{r}
+myprocess <- textProcessor(df$tokens, metadata = df ,wordLengths=c(2,Inf),lowercase = F,
+                           removenumbers = F, removepunctuation = F, removestopwords = F, stem = F,customstopwords = stopwords)
+myprocess
+length(myprocess$docs.removed)
+```
+
+```{r}
+# N개 이상의 문서에서 등장한 단어만 사용(lower.thresh)
+out <- prepDocuments(myprocess$documents, myprocess$vocab, myprocess$meta,lower.thresh = 50)
+```
+
+```{r}
+model1_searchK <- searchK(out$documents, out$vocab, K = c(4:30),
+                                prevalence = ~origin+s(publication_year),
+                                data = out$meta, init.type="Spectral"
+                                  ,cores=detectCores()-1)
+saveRDS(model1_searchK,'model1_searchK.rds')
+```
+
+```{r}
+plot(model1_searchK)
+```
+
+```{r}
+model1_res <- model1_searchK$results
+model1_res <- unnest(model1_res,c(K,exclus,semcoh))
+```
+
+```{r}
+ggplot(model1_res, aes(x = semcoh, y = exclus, label = K)) +
+  geom_point() +
+  geom_text(vjust = -0.5, hjust = 0.5) +
+  labs(x = "Semantic Coherence", y = "Exclusivity", title = "Semantic Coherence vs Exclusivity") +
+  theme_minimal()
+```
+
+```{r}
+stm_model1 <- stm(out$documents, out$vocab, K=13,
+              prevalence= ~origin+s(publication_year),
+              data=out$meta, init.type="Spectral",seed=2024,
+              verbose = F)
+```
+
+```{r}
+summary(stm_model1)
+```
+
+```{r}
+plot(stm_model1,type='summary',labeltype = 'frex',n=5)
+```
+
+```{r}
+# 고화질 PNG 파일 설정
+png(filename = "Top_Topics.png", width = 1800, height = 1200, res = 150)
+plot(stm_model1,type='summary',labeltype = 'frex',n=5)
+dev.off()
+```
+
+```{r}
+# STM 결과 df로 저장
+tmp <- labelTopics(stm_model1, n = 10)
+
+df_prob <- as.data.frame(tmp$prob)
+df_prob["topic_num"] <- as.numeric(1:nrow(df_prob))
+df_prob["index"] <- "prob"
+
+df_frex <- as.data.frame(tmp$frex)
+df_frex["topic_num"] <- as.numeric(1:nrow(df_prob))
+df_frex["index"] <- "frex"
+
+df_lift <- as.data.frame(tmp$lift)
+df_lift["topic_num"] <- as.numeric(1:nrow(df_prob))
+df_lift["index"] <- "lift"
+
+df_score <- as.data.frame(tmp$score)
+df_score["topic_num"] <- as.numeric(1:nrow(df_prob))
+df_score["index"] <- "score"
+
+df_stm_model <- rbind(rbind(rbind(df_prob, df_frex), df_lift), df_score)
+df_stm_model <- df_stm_model %>%
+  relocate(c(topic_num, index)) %>% arrange(topic_num)
+
+# df를 excel로 저장
+write_xlsx(df_stm_model, "stm_model_keywords.xlsx")
+```
+
+```{r}
+m1_K <- stm_model1$settings$dim$K
+stm_effect_model <-  estimateEffect(1:m1_K ~origin+s(publication_year),
+                                 stm_model1, meta = out$meta, uncertainty = "Global",prior=1e-5)
+```
+
+### 문서별 토픽 분포
+
+```{r}
+# topic_document <- data.frame(stm_model1[["theta"]])
+# topic_document$category <- out$meta$origin
+# topic_document$year <- out$meta$publication_year
+# topic_document$id <- out$meta$id
+# names(topic_document) <- c("topic1", "topic2", "topic3", "topic4", "topic5", "topic6", "topic7", "topic8", "topic9", "topic10", "topic11", "topic12","topic13","origin", "publication_year",'id')
+# 토픽 모델의 토픽 분포(theta)로부터 데이터 프레임 생성
+topic_document <- data.frame(stm_model1[["theta"]])
+# 추가 메타 데이터 컬럼 할당
+topic_document$category <- out$meta$origin
+topic_document$year <- out$meta$publication_year
+topic_document$id <- out$meta$id
+topic_document$tokens <- out$meta$tokens
+
+# 토픽 개수를 기반으로 이름 생성
+num_topics <- ncol(stm_model1[["theta"]])  # 토픽 모델의 토픽 개수
+topic_names <- paste("topic", 1:num_topics, sep = "")  # 토픽 이름 생성
+
+# 새로운 컬럼 이름 설정
+names(topic_document) <- c(topic_names, "origin", "publication_year", "id","tokens")
+```
+
+```{r}
+topic_document_long <-  
+topic_document %>%
+  pivot_longer(
+    cols = starts_with("topic"),
+    names_to = "topic",
+    values_to = "distribution"
+  ) %>% 
+  mutate(
+    topic = factor(topic, levels = paste0("topic", 1:m1_K))
+  )
+```
+
+```{r}
+# Boxplot 시각화: 학문 분류별로 토픽의 분포 표시
+ggplot(topic_document_long, aes(x = topic, y = distribution, fill = origin)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Topic Distribution by Journal Publication Location", x = "Topic", y = "Distribution") +
+  facet_wrap(~origin, scales = "free")
+```
+
+```{r}
+# ggplot 그래프 생성 및 저장을 위한 변수에 할당
+p <- ggplot(topic_document_long, aes(x = topic, y = distribution, fill = origin)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Topic Distribution by Journal Publication Location", x = "Topic", y = "Distribution") +
+  facet_wrap(~origin, scales = "free")
+
+# 고화질로 그래프 저장
+ggsave(filename = "Topic Distribution.png", plot = p, device = "png", width = 12, height = 8, dpi = 300)
+```
+
+### 효과추정
+
+```{r}
+summary(stm_effect_model, topics= 1:m1_K)
+```
+
+```{r}
+plot.estimateEffect(stm_effect_model, covariate = "origin", 
+                    topics = c(1:m1_K), method = "difference",
+                    model = stm_model1, # to show labels alongside
+                    cov.value1 = "out", cov.value2 = "in",
+                    xlab = "In <------------------------> Out", xlim = c(-.4, .4),
+                    labeltype = "frex", n = 7, 
+                    width = 100,  verbose.labels = F)
+```
+
+```{r}
+# 고화질 PNG 파일 설정
+png(filename = "estimateEffect_plot.png", width = 1800, height = 1200, res = 150)
+
+# plot.estimateEffect 호출
+plot.estimateEffect(stm_effect_model, covariate = "origin", 
+                    topics = c(1:m1_K), method = "difference",
+                    model = stm_model1, # to show labels alongside
+                    cov.value1 = "out", cov.value2 = "in",
+                    xlab = "In <------------------------> Out", xlim = c(-.4, .4),
+                    labeltype = "frex", n = 7, 
+                    width = 100, verbose.labels = FALSE)
+
+# 그래픽 장치 종료
+dev.off()
+```
+
+```{r}
+# 고화질 PNG 파일 설정
+png(filename = "estimateEffect_plot_label.png", width = 1800, height = 1200, res = 150)
+
+# plot.estimateEffect 호출
+custom_labels <- c(
+  'T1:Joseon Diplomacy***', 
+  'T2:Korean Cultural Identity', 
+  'T3:Korean Cinema Globalization***', 
+  'T4:Buddhist History', 
+  'T5:Korean Literary Narrative', 
+  'T6:Gender and K-Pop*', 
+  'T7:North Korean Politics***', 
+  'T8:Korean War Impact**', 
+  'T9:Confucian Philosophy***', 
+  'T10:Japanese Colonial Influence', 
+  'T11:Memory and Urban Space', 
+  'T12:Historical Governance', 
+  'T13:Social Change and Research***'
+)
+plot.estimateEffect(stm_effect_model, covariate = "origin", 
+                    topics = c(1:m1_K), method = "difference",
+                    model = stm_model1, # to show labels alongside
+                    cov.value1 = "out", cov.value2 = "in",
+                    xlab = "In <------------------------> Out", xlim = c(-.1, .1),
+                    labeltype = "custom", 
+                    width = 100, verbose.labels = FALSE,
+                    custom.labels =custom_labels )
+# 그래픽 장치 종료
+dev.off()
+```
+
+### 시계열 토픽
+
+```{r}
+# 시계열 시각화(모든 토픽)
+plot.estimateEffect(stm_effect_model,model=stm, covariate = "publication_year",
+                    topics = c(1:m1_K), method = "continuous")
+```
+
+```{r}
+# 문서별 토픽 비중 (theta) 추출
+topic_proportions <- as.data.frame(stm_model1$theta)
+names(topic_proportions) <- paste("Topic", 1:length(stm_model1$theta[1,]), sep="")
+
+# 메타 데이터와 결합하기 위한 준비
+topic_proportions$document <- row.names(topic_proportions)  # 문서 번호를 통해 행 이름을 document로 설정
+
+# 메타 데이터에 document 컬럼 추가, 여기서는 out$meta를 사용
+out$meta$document <- row.names(out$meta)
+
+# 메타 데이터와 결합
+topic_proportions <- topic_proportions %>%
+  pivot_longer(cols = -document, names_to = "topic", values_to = "proportion") %>%
+  left_join(out$meta, by = "document")
+
+# 시간과 토픽별 평균 비중 계산
+topic_proportions <- topic_proportions %>%
+  group_by(topic, publication_year) %>%
+  summarise(mean_proportion = mean(proportion), .groups = 'drop')
+
+# 시각화
+ggplot(topic_proportions, aes(x = publication_year, y = mean_proportion, color = topic)) +
+  geom_line() +
+  labs(title = "Time Series of Topic Proportions",
+       x = "Publication Year",
+       y = "Mean Topic Proportion",
+       color = "Topic") +
+  theme_minimal() +
+  theme(text = element_text(size = 12),
+        axis.title = element_text(size = 14, face = "bold"),
+        legend.title = element_text(size = 13),
+```
+
+```{r}
+# 데이터 정리
+topic_proportions <- topic_proportions %>%
+  mutate(topic = as.numeric(gsub("Topic", "", topic))) %>%  # 토픽 번호를 숫자로 변환
+  arrange(topic, publication_year)  # 토픽과 연도별로 정렬
+
+# 스몰 멀티플즈 시각화
+ggplot(topic_proportions, aes(x = publication_year, y = mean_proportion)) +
+  geom_line() +
+  facet_wrap(~ topic, scales = "free_y") +
+  labs(title = "Time Series of Topic Proportions by Topic",
+       x = "Publication Year",
+       y = "Mean Topic Proportion") +
+  theme_minimal() +
+  theme(axis.title.x = element_text(size = 12),
+        axis.title.y = element_text(size = 12),
+        strip.text.x = element_text(size = 10, face = "bold"))
+```
+
+```{r}
+# 히트맵 그리기
+heatmap_plot <- ggplot(topic_proportions, aes(x = publication_year, y = factor(topic, levels = 1:max(topic)), fill = mean_proportion)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = brewer.pal(9, "Reds")) +  # "Reds" 색상 팔레트 사용
+  labs(title = "Heatmap of Topic Proportions Over Time",
+       x = "Publication Year",
+       y = "Topic",
+       fill = "Mean Proportion") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title = element_text(size = 14),
+        legend.title = element_text(size = 12))
+
+# 고화질 PNG 파일로 저장
+ggsave("topic_year_heatmap.png", plot = heatmap_plot, width = 10, height = 8, dpi = 300)
+```
+
+```{r}
+library(viridis)  # viridis 패키지 로드
+
+# 히트맵 시각화
+ggplot(topic_proportions, aes(x = publication_year, y = factor(topic, levels = 1:max(topic)), fill = mean_proportion)) +
+  geom_tile() +
+  scale_fill_viridis(option = "C", direction = -1) +  # viridis 색상 스케일, 높은 값이 진하게
+  labs(title = "Heatmap of Topic Proportions Over Time",
+       x = "Publication Year",
+       y = "Topic",
+       fill = "Mean Proportion") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title = element_text(size = 14),
+        legend.title = element_text(size = 12))
+```
+
+```{r}
+#### 시간에 따른 토픽 비율 변화 (토픽별로)
+custom_labels_wo <- c(
+  'T1:Joseon Diplomacy', 
+  'T2:Korean Cultural Identity', 
+  'T3:Korean Cinema Globalization', 
+  'T4:Buddhist History', 
+  'T5:Korean Literary Narrative', 
+  'T6:Gender and K-Pop', 
+  'T7:North Korean Politics', 
+  'T8:Korean War Impact', 
+  'T9:Confucian Philosophy', 
+  'T10:Japanese Colonial Influence', 
+  'T11:Memory and Urban Space', 
+  'T12:Historical Governance', 
+  'T13:Social Change and Research'
+)
+par(mfrow=c(2,2))
+j <- 1
+for (i in c(1:m1_K))
+{
+  plot(stm_effect_model, "publication_year", method = "continuous", topics = i, printlegend = F,
+  # main = stm_custom_label[j], xaxt = "n")
+  #main = paste(paste0('T', i,':'),paste(stm_custom_label[i], collapse = ", "),sep=' '),
+  #xaxt ="n")
+  
+  # 토픽 이름대신 keyword로 표현하고 싶으면 아래 main 활용 
+  main =  paste(paste(custom_labels_wo[i], collapse = ", "),sep=' '))
+  
+  yearseq <- seq(from=as.Date('2000-01-01'), to=as.Date('2023-12-31'),by='year')
+yearnames <- year(yearseq)
+axis(1,at=as.numeric(yearseq) - min(as.numeric(yearseq)),labels=yearnames)
+  
+  j <- j+1
+
+}
+```
+
+```{r}
+# 고화질 PNG 파일 설정
+png(filename = "topic_trends1.png", width = 4800, height = 3200, res = 300)
+
+# 2x2 그리드 설정
+par(mfrow = c(2, 2), cex = 1.2)  # 전체 텍스트 크기 조정
+
+for (i in 1:4) {
+  # 플롯 생성: 폰트 크기 및 선 굵기 조정
+  plot(stm_effect_model, "publication_year", method = "continuous", topics = i, printlegend = FALSE,
+       main = paste(paste(custom_labels_wo[i], collapse = ", "), sep=' '),
+       cex.main = 1.4,    # 메인 제목의 크기
+       cex.lab = 1.2,     # 축 라벨의 크기
+       cex.axis = 1,      # 축 텍스트의 크기
+       lwd = 1.5)         # 선의 굵기
+
+  # X축 년도 조정 (예시)
+  yearseq <- seq(from = as.Date('2000-01-01'), to = as.Date('2023-12-31'), by = 'year')
+  yearnames <- format(yearseq, "%Y")
+  axis(1, at = seq_along(yearseq), labels = yearnames, cex.axis = 1)  # 축 텍스트 크기 재조정
+}
+
+# 그래픽 장치 종료
+dev.off()
+```
+
+```{r}
+# 고화질 PNG 파일 설정
+png(filename = "topic_trends2.png", width = 4800, height = 3200, res = 300)
+
+# 2x2 그리드 설정
+par(mfrow = c(2, 2), cex = 1.2)  # 전체 텍스트 크기 조정
+
+for (i in 5:8) {
+  # 플롯 생성: 폰트 크기 및 선 굵기 조정
+  plot(stm_effect_model, "publication_year", method = "continuous", topics = i, printlegend = FALSE,
+       main = paste(paste(custom_labels_wo[i], collapse = ", "), sep=' '),
+       cex.main = 1.4,    # 메인 제목의 크기
+       cex.lab = 1.2,     # 축 라벨의 크기
+       cex.axis = 1,      # 축 텍스트의 크기
+       lwd = 1.5)         # 선의 굵기
+
+  # X축 년도 조정 (예시)
+  yearseq <- seq(from = as.Date('2000-01-01'), to = as.Date('2023-12-31'), by = 'year')
+  yearnames <- format(yearseq, "%Y")
+  axis(1, at = seq_along(yearseq), labels = yearnames, cex.axis = 1)  # 축 텍스트 크기 재조정
+}
+
+# 그래픽 장치 종료
+dev.off()
+```
+
+```{r}
+# 고화질 PNG 파일 설정
+png(filename = "topic_trends3.png", width = 4800, height = 3200, res = 300)
+
+# 2x2 그리드 설정
+par(mfrow = c(2, 2), cex = 1.2)  # 전체 텍스트 크기 조정
+
+for (i in 9:12) {
+  # 플롯 생성: 폰트 크기 및 선 굵기 조정
+  plot(stm_effect_model, "publication_year", method = "continuous", topics = i, printlegend = FALSE,
+       main = paste(paste(custom_labels_wo[i], collapse = ", "), sep=' '),
+       cex.main = 1.4,    # 메인 제목의 크기
+       cex.lab = 1.2,     # 축 라벨의 크기
+       cex.axis = 1,      # 축 텍스트의 크기
+       lwd = 1.5)         # 선의 굵기
+
+  # X축 년도 조정 (예시)
+  yearseq <- seq(from = as.Date('2000-01-01'), to = as.Date('2023-12-31'), by = 'year')
+  yearnames <- format(yearseq, "%Y")
+  axis(1, at = seq_along(yearseq), labels = yearnames, cex.axis = 1)  # 축 텍스트 크기 재조정
+}
+
+# 그래픽 장치 종료
+dev.off()
+
+```
+
+```{r}
+# 고화질 PNG 파일 설정
+png(filename = "topic_trends4.png", width = 4800, height = 3200, res = 300)
+
+# 2x2 그리드 설정
+par(mfrow = c(2, 2), cex = 1.2)  # 전체 텍스트 크기 조정
+
+for (i in 13:13) {
+  # 플롯 생성: 폰트 크기 및 선 굵기 조정
+  plot(stm_effect_model, "publication_year", method = "continuous", topics = i, printlegend = FALSE,
+       main = paste(paste(custom_labels_wo[i], collapse = ", "), sep=' '),
+       cex.main = 1.4,    # 메인 제목의 크기
+       cex.lab = 1.2,     # 축 라벨의 크기
+       cex.axis = 1,      # 축 텍스트의 크기
+       lwd = 1.5)         # 선의 굵기
+
+  # X축 년도 조정 (예시)
+  yearseq <- seq(from = as.Date('2000-01-01'), to = as.Date('2023-12-31'), by = 'year')
+  yearnames <- format(yearseq, "%Y")
+  axis(1, at = seq_along(yearseq), labels = yearnames, cex.axis = 1)  # 축 텍스트 크기 재조정
+}
+
+# 그래픽 장치 종료
+dev.off()
+```
+
+### 교호작용(origin\*publication_year)
+
+```{r}
+stm_model1_inter <- stm(out$documents, out$vocab, K=13,
+              prevalence= ~origin*publication_year,
+              data=out$meta, init.type="Spectral",seed=2024,
+              verbose = F)
+```
+
+```{r}
+stm_effect_inter_model <-  estimateEffect(1:m1_K ~origin*publication_year,
+                                 stm_model1_inter, meta = out$meta, uncertainty = "Global",prior=1e-5)
+```
+
+```{r}
+summary(stm_effect_inter_model)
+```
+
+```{r}
+# # 상호작용 효과 추정
+# effect_estimation <- estimateEffect(formula = 1:m1_K ~ publication_year * origin, 
+#                                     stmobj = stm_model1_inter, metadata = out$meta)
+# 
+# # 추정된 효과를 데이터 프레임으로 변환
+# # 참고: `tidy` 함수 대신 사용할 수 있는 적절한 변환 과정이 필요할 수 있습니다.
+# effect_df <- tidy(effect_estimation)
+# 
+# # 'in'과 'out'을 모두 포함하는 그래프 생성 및 저장
+# for (i in 1:m1_K) {
+#   p <- effect_df %>% 
+#     filter(topic == i) %>% 
+#     ggplot(aes(x = publication_year, y = estimate, color = origin)) +
+#     geom_line() +
+#     geom_ribbon(aes(ymin = estimate - 2 * std.error, ymax = estimate + 2 * std.error, fill = origin), alpha = 0.2) +
+#     labs(title = paste("Topic", i, "- Interaction Effect of Origin"), x = "Publication Year", y = "Topic Proportion") +
+#     theme_minimal() +
+#     theme(legend.position = "bottom")
+#   
+#   # 파일 경로와 이름 지정
+#   file_path <- paste0(folder_name, "/Topic_", i, "_interaction_effect.png")
+#   
+#   # 그래프를 파일로 저장
+#   ggsave(filename = file_path, plot = p, device = "png", width = 10, height = 6, dpi = 300)
+# }
+```
+
+```{r}
+save.image('240408.RData')
+```
+
+```{r}
+run_stminsights()
+```
